@@ -1,0 +1,227 @@
+// S10 — the IN-PROCESS queue port for the gateway subsystem. Successor to the retired CLI
+// queue-bridge (which shelled out to `rig queue` from the relay's separate process): in-daemon
+// there is no process boundary, so fleet access is a direct QueueRepository read/write. The
+// SELECTION SEMANTICS consume the single structured OWNER classification written with the
+// queue transition. Tags and destination spellings are not a second alert classifier.
+//   - reads are unbounded (the B5 lesson: a default limit silently truncates a large backlog).
+
+import type { QueueRepository, QueueItem as RepoQueueItem } from "../../queue-repository.js";
+import { loadHumanRegistry, registeredPeople, resolveRegisteredHumanAddress, type LoadResult, type HumanFragment } from "../human-registry.js";
+import { sharedChannelAddresses } from "../participants.js";
+import type { HumanQuestion } from "../../human-questions.js";
+import { ownerNotificationLevelAtLeast, type OwnerNotificationLevel, type QueueTransition } from "../../queue-transition-log.js";
+
+/** The narrow projection the slack path consumes (shape-compatible with the retired bridge's
+ *  QueueItem so message construction and tests carry over). */
+export interface QueueItem {
+  qitemId: string;
+  destinationSession?: string | null;
+  sourceSession?: string | null;
+  tags?: string[] | null;
+  state?: string | null;
+  tier?: string | null;
+  humanIntent?: "decision" | "update" | null;
+  humanDetail?: string | null;
+  replyTo?: string | null;
+  humanQuestions?: HumanQuestion[] | null;
+  /** Posted into a registered shared channel (0.7.3): nobody there can answer, so its questions show as text. */
+  sharedChannel?: boolean;
+  summary?: string | null;
+  body?: string | null;
+  evidenceRef?: string | null;
+  notificationKey?: string | null;
+  ownerNotificationKind?: string | null;
+  ownerNotificationLevel?: OwnerNotificationLevel | null;
+}
+
+export interface AlertFilterOpts {
+  minimumLevel?: OwnerNotificationLevel;
+}
+
+/** PURE: select active qitems whose transition carries a sufficient OWNER classification. */
+export function filterHumanAlerts(items: QueueItem[], opts: AlertFilterOpts): QueueItem[] {
+  const active = new Set(["pending", "in-progress", "blocked"]);
+  return items.filter((q) => {
+    if (q.state && !active.has(q.state)) return false;
+    // An ask posts only when its asker marked it alert-worthy: a human-required ask at RECORD is on Steering whatever
+    // the posting dial says (the dial governs updates and notices).
+    if (q.ownerNotificationKind === "human-required" && q.ownerNotificationLevel === "RECORD") return false;
+    return q.ownerNotificationLevel
+      ? ownerNotificationLevelAtLeast(q.ownerNotificationLevel, opts.minimumLevel ?? "NOTICE")
+      : false;
+  });
+}
+
+export interface CreateQitemInput {
+  qitemId?: string;
+  source: string;
+  destination: string;
+  summary: string;
+  body: string;
+  priority?: string;
+  tags?: string[];
+  /** #822 — the ask whose OpenRig thread this message, answer, or reaction came from. */
+  inReplyTo?: string;
+  /** A current typed/button answer, never a reaction or a recovered late message. */
+  humanAnswer?: boolean;
+}
+
+/** What the inbound router needs: land a durable qitem, get its id (or throw). */
+export interface InboundQueuePort {
+  createQitem(input: CreateQitemInput): Promise<string>;
+  getQitem?(qitemId: string): QueueItem | null;
+  getHumanAnswer?(qitemId: string, actorSession: string): { qitemId: string; body: string } | null;
+}
+
+/** What the outbound driver needs: the current human-alert set, full items included. */
+export interface OutboundQueuePort {
+  listHumanAlerts(filter: AlertFilterOpts): Promise<QueueItem[]>;
+}
+
+/** One open ask's current episode for `rig slack post-open-asks`: posted (it has its receipt) and eligible (at or above
+ *  the posting floor, as recorded) say whether Slack still owes it a post. */
+export interface OpenAskEpisode {
+  item: QueueItem;
+  posted: boolean;
+  eligible: boolean;
+}
+
+function project(q: RepoQueueItem, transition: QueueTransition, entities: readonly HumanFragment[], channels: ReadonlyArray<{ address: string }> = []): QueueItem | null {
+  const r = q as unknown as Record<string, unknown>;
+  let destinationSession: string | null = null;
+  let sourceSession: string | null = null;
+  let sharedChannel = false;
+  // The row's agent side, the seat its Slack thread routes to: for a row addressed to a person or a shared channel (an
+  // ask, including one its asker parked on the person asked), the agent that sent it; otherwise the agent that owns it.
+  const addressedToParticipant = resolveRegisteredHumanAddress(q.destinationSession, entities) !== null
+    || channels.some((channel) => channel.address === q.destinationSession);
+  const agentSide = addressedToParticipant ? q.sourceSession : q.destinationSession;
+  if (transition.ownerNotificationKind === "human-decision-resolved") {
+    destinationSession = resolveRegisteredHumanAddress(transition.actorSession, entities);
+    sourceSession = agentSide;
+  } else if (q.state === "blocked") {
+    destinationSession = resolveRegisteredHumanAddress(q.blockedOn, entities);
+    sourceSession = agentSide;
+  } else {
+    // A row addressed to a person, or to a registered shared channel (posted into that channel; 0.7.3).
+    destinationSession = resolveRegisteredHumanAddress(q.destinationSession, entities);
+    if (!destinationSession) {
+      destinationSession = channels.find((channel) => channel.address === q.destinationSession)?.address ?? null;
+      sharedChannel = destinationSession !== null;
+    }
+    sourceSession = q.sourceSession;
+  }
+  if (!destinationSession) return null;
+  return {
+    qitemId: String(r.qitemId),
+    destinationSession,
+    sourceSession,
+    tags: (r.tags as string[] | null) ?? null,
+    state: (r.state as string | null) ?? null,
+    tier: (r.tier as string | null) ?? null,
+    humanIntent: q.humanIntent,
+    humanDetail: q.humanDetail,
+    replyTo: q.replyTo ?? null,
+    humanQuestions: q.humanQuestions ?? null,
+    ...(sharedChannel ? { sharedChannel } : {}),
+    summary: (r.summary as string | null) ?? null,
+    body: (r.body as string | null) ?? null,
+    evidenceRef: (r.evidenceRef as string | null) ?? null,
+    notificationKey: `${q.qitemId}:${transition.transitionId}`,
+    ownerNotificationKind: transition.ownerNotificationKind,
+    ownerNotificationLevel: transition.ownerNotificationLevel,
+  };
+}
+
+/** Slice-11 item 9, carried over verbatim from the retired outbound.ts: on ENABLE, seed all
+ *  currently-active human alerts as history/seen WITHOUT posting, so turning the connector on
+ *  never replays the backlog. Returns the honest online-status line marking the transition. */
+export async function seedBacklogAsHistory(opts: {
+  queue: OutboundQueuePort;
+  seen: import("./state-store.js").SeenStore;
+  filter: AlertFilterOpts;
+  /** The durable dispatch buffer, read only to say what the restart will replay: earlier posts that
+   *  failed or never finished. An alert whose row has since closed is dropped; the rest post. */
+  buffer?: Pick<import("../dispatch-buffer.js").DispatchBuffer, "pending">;
+  log?: (msg: string) => void;
+}): Promise<{ seeded: number; onlineStatus: string }> {
+  const alerts = await opts.queue.listHumanAlerts(opts.filter);
+  const already = opts.seen.load();
+  const toSeed = alerts.map((a) => a.notificationKey ?? a.qitemId).filter((id) => !already.has(id));
+  const seeded = opts.seen.seed(toSeed, "seeded-at-enable");
+  const retained = (opts.buffer?.pending() ?? []).filter((d) => d.op === "post_message").length;
+  const retainedNote = retained > 0
+    ? ` ${retained} earlier undelivered post(s) wait in the replay buffer: an alert whose row has since closed is dropped; the rest post (open rows' alerts, decision-resolved notices, digests).`
+    : "";
+  const onlineStatus = `slack outbound ENABLED at enable-time: ${seeded} pre-existing alert(s) seeded as history (not reposted); only alerts created after this point will deliver.${retainedNote}`;
+  opts.log?.(onlineStatus);
+  return { seeded, onlineStatus };
+}
+
+/** Build both ports over the daemon's own QueueRepository. In-process: no shell, no transport,
+ *  no `-A` scope trap (list() here is repository-wide), no bounded-body N+1 (rows carry bodies). */
+export function makeQueuePorts(
+  queueRepo: QueueRepository,
+  opts: { loadHumanRegistry?: () => LoadResult; sharedChannels?: () => ReadonlyArray<{ address: string }> } = {},
+): InboundQueuePort & OutboundQueuePort & { listOpenAsks(filter: AlertFilterOpts): Promise<OpenAskEpisode[]> } {
+  /** Each active row's current owner-notification episode, projected to its person or shared channel. Posted episodes
+   *  are skipped unless asked for (the alert sweep never wants them). Null when nobody is registered. */
+  const currentEpisodes = (includePosted: boolean): Array<{ item: QueueItem; posted: boolean }> | null => {
+    // Nobody registered yet isn't a broken registry: rows to a registered shared channel still post (0.7.3).
+    const people = registeredPeople((opts.loadHumanRegistry ?? (() => loadHumanRegistry()))());
+    if (!people) return null;
+    const channels = (opts.sharedChannels ?? (() => sharedChannelAddresses()))();
+    // Avoid building waiting/recovery views for rows with no unposted owner notification.
+    // Keep list(activeOnly)'s selection, ordering and cap; this remains an O(N) ID scan.
+    const ids = queueRepo.db.prepare(
+      `SELECT qitem_id FROM queue_items
+       WHERE state IN ('pending', 'in-progress', 'blocked')
+       ORDER BY CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END, ts_created DESC
+       LIMIT ?`,
+    ).all(1000000) as Array<{ qitem_id: string }>;
+    return ids.flatMap(({ qitem_id: qitemId }) => {
+      const transition = queueRepo.transitionLog.latestOwnerNotificationForQitem(qitemId);
+      if (!transition) return [];
+      const notificationKey = `${qitemId}:${transition.transitionId}`;
+      const posted = queueRepo.transitionLog.hasOwnerNotificationReceipt(qitemId, notificationKey);
+      if (posted && !includePosted) return [];
+      const row = queueRepo.getById(qitemId);
+      if (!row) return [];
+      const item = project(row, transition, people, channels);
+      return item ? [{ item, posted }] : [];
+    });
+  };
+  return {
+    getQitem: (qitemId) => queueRepo.getById(qitemId),
+    getHumanAnswer: (qitemId, actorSession) => queueRepo.getHumanAnswer(qitemId, actorSession),
+    async createQitem(input: CreateQitemInput): Promise<string> {
+      const ask = input.inReplyTo ? queueRepo.getById(input.inReplyTo) : null;
+      const directAnswer = input.humanAnswer && ask && ask.destinationSession === input.source && ask.humanIntent !== "update"
+        && queueRepo.isPersonAddress(input.source);
+      const createInput = {
+        qitemId: input.qitemId,
+        sourceSession: input.source,
+        destinationSession: input.destination,
+        body: input.body,
+        summary: input.summary,
+        priority: (input.priority ?? "routine") as never,
+        tags: input.tags ?? ["founder-slack", "inbound"],
+        inboundReplyTo: input.inReplyTo ?? null,
+        gatewayInbound: true,
+      };
+      const created = directAnswer && input.inReplyTo
+        ? await queueRepo.createHumanAnswer({ ...createInput, inboundReplyTo: input.inReplyTo })
+        : await queueRepo.create(createInput);
+      return (created as unknown as { qitemId: string }).qitemId;
+    },
+    async listHumanAlerts(filter: AlertFilterOpts): Promise<QueueItem[]> {
+      return filterHumanAlerts((currentEpisodes(false) ?? []).map(({ item }) => item), filter);
+    },
+    /** Every open ask (a human-required episode, posted or not, at any level), each marked posted and eligible. */
+    async listOpenAsks(filter: AlertFilterOpts): Promise<OpenAskEpisode[]> {
+      return (currentEpisodes(true) ?? [])
+        .filter(({ item }) => item.ownerNotificationKind === "human-required")
+        .map(({ item, posted }) => ({ item, posted, eligible: filterHumanAlerts([item], filter).length === 1 }));
+    },
+  };
+}

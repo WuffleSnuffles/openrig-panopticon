@@ -1,0 +1,418 @@
+import { Hono } from "hono";
+import { CAPTURE_INPUT_BOX_DEADLINE_MS, CAPTURE_READABLE_BUDGET_MS, type SessionTransport, type TargetSpec } from "../domain/session-transport.js";
+import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
+import { requireSenderIdentity, resolveRecordedIdentity, transportSenderSession } from "./require-sender-identity.js";
+import { OCCUPANT_GENERATION_HEADER, runtimeSwitchCustodyRefusal } from "./runtime-switch-custody.js";
+import { runtimeSwitchCommittedSince, runtimeSwitchSummary } from "../domain/seat-runtime-switch-service.js";
+import type Database from "better-sqlite3";
+import type { OutboxHandler } from "../domain/outbox-handler.js";
+import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
+
+// S2 (OPR.0.5.4.3) — the sender-side half of two-ended honesty: appended to any
+// unattributed delivery's success payload and surfaced by the CLI renderers.
+// Held to the S1 truthfulness bar for a success payload: what happened, what the
+// recipient cannot know, and the concrete fix (sign).
+const UNKNOWN_SENDER_NOTICE =
+  "Delivered without sender identity: this request carried no X-OpenRig-Session header, so your recipient has no way of knowing who sent it. Follow up and sign it: from a seat shell the header stamps automatically; from anywhere else, send it as a declared sender, `rig queue create --source <you>@external --destination <seat> --summary \"<one line>\" --body-file <file>` (recorded as declared; a registered human gets a reply route), or join this shell to a seat, `eval \"$(rig attach --self --rig <rigId> --node <logicalId> --print-env)\"`, so its sends carry that seat's name (`rig attach --help` covers adding a new member).";
+
+// The unknown-sender From: marker, DERIVED from the canonical envelope wrapper
+// (pane-envelope.ts SENDER_FALLBACK is unexported and its literal is
+// canonicity-guarded to exactly two twin sites) — deriving at module load keeps
+// one source of truth with no third definition. wrapPaneEnvelope with an absent
+// sender renders "From: <marker>" as its first line.
+const UNKNOWN_SENDER_MARKER = wrapPaneEnvelope(undefined, "", "").split("\n")[0]!.replace(/^From: /, "");
+
+export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
+  const router = new Hono();
+
+  const terminalToken = opts?.bearerToken ?? null;
+  router.use("*", authBearerTokenMiddleware({ expectedToken: terminalToken }));
+
+  router.post("/send", async (c) => {
+    const transport = c.get("sessionTransport" as never) as SessionTransport;
+    const body = await c.req.json<{
+      session?: string;
+      deliveryId?: string;
+      text: string;
+      verify?: boolean;
+      force?: boolean;
+      waitForIdleMs?: number;
+      dangerouslyInteract?: boolean;
+      typeWithoutChecking?: boolean;
+      reason?: string;
+      actorSession?: string | null;
+      submitOnly?: boolean;
+      expectedStagedText?: string;
+      expectedStagedLineCount?: number;
+      /** The unwrapped text; typed instead of `text` when the recipient is a terminal seat. */
+      exactText?: string;
+      urgent?: boolean;
+    }>();
+
+    // submitOnly (mechanics-gate fix d9b3989a) sends NO text — the Enter-only retry for staged
+    // content; every other send still requires text.
+    if (!body.session || (!body.text && !body.submitOnly)) {
+      return c.json({ error: "Missing required fields: session, text" }, 400);
+    }
+    // OPR.0.4.1.10 — the danger override and wait mode are contradictory; reject before transport.
+    if (body.dangerouslyInteract && body.waitForIdleMs !== undefined) {
+      return c.json({
+        ok: false,
+        reason: "invalid_dangerously_interact",
+        error: "--dangerously-interact cannot be combined with --wait-for-idle. No text was sent.",
+      }, 400);
+    }
+    // The override must carry a reason for the audit record.
+    if (body.dangerouslyInteract && (!body.reason || body.reason.trim().length === 0)) {
+      return c.json({
+        ok: false,
+        reason: "dangerously_interact_requires_reason",
+        error: "--dangerously-interact requires --reason explaining why the prompt is being driven. No text was sent.",
+      }, 400);
+    }
+    if (body.waitForIdleMs !== undefined) {
+      if (body.force) {
+        return c.json({
+          ok: false,
+          reason: "invalid_wait_for_idle",
+          error: "--wait-for-idle cannot be combined with force. No text was sent.",
+        }, 400);
+      }
+      if (typeof body.waitForIdleMs !== "number" || !Number.isFinite(body.waitForIdleMs) || body.waitForIdleMs <= 0) {
+        return c.json({
+          ok: false,
+          reason: "invalid_wait_for_idle",
+          error: "waitForIdleMs must be a positive number. No text was sent.",
+        }, 400);
+      }
+    }
+
+    // P21 I4 + S2 (OPR.0.5.4.3): the actor (the --dangerously-interact override AUDIT actor) is
+    // DERIVED from the transport header, never body.actorSession. A body claim that DIFFERS is
+    // simply SUPERSEDED, never a refusal: the wire decides the actor and the body never does
+    // (PM ruling (A), 2026-08-11 — see require-sender-identity.ts:16-22). An ABSENT header no
+    // longer refuses (founder descope, S2): a spoofer defeats a refusal by adding a header, so
+    // the 401 only ever stopped honest uncounted callers. Instead the send DELIVERS, the
+    // already-nullable audit actor records null (projected "unknown"), and the response carries
+    // the sign-it notice below.
+    if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
+      error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
+    const derivedActor = transportSenderSession(c) ?? null;
+    // The MCP adapter's caller, on a direct attributed send, for every outbox row this send writes (guarded, retained or the
+    // audit record below); otherwise the stamp this route has always recorded.
+    const attributed = derivedActor ? resolveRecordedIdentity(c, { provenance: "transport:v1" }) : null;
+    const sendIdentity = attributed?.identityPrincipal
+      ? { identityProvenance: "principal:v1", identityPrincipal: attributed.identityPrincipal }
+      : derivedActor ? { identityProvenance: "transport:v1" } : {};
+    // Slice 16: a runtime switch's own predecessor or not-yet-committed successor doesn't send as the seat.
+    const db = c.get("db" as never) as Database.Database;
+    const switchHeld = runtimeSwitchCustodyRefusal(db, derivedActor, c.req.header(OCCUPANT_GENERATION_HEADER));
+    if (switchHeld) return c.json(switchHeld.body, switchHeld.status);
+
+    // Check for ambiguity first
+    const resolved = await transport.resolveSessions({ session: body.session });
+    if (!resolved.ok) {
+      const status = resolved.code === "ambiguous" ? 409 : 404;
+      return c.json({ ok: false, error: resolved.error }, status);
+    }
+
+    const exactText = typeof body.exactText === "string" ? body.exactText : undefined;
+    // Slice 16: a seat that is switching runtime takes no input until its switch ends. Rather than wait behind the
+    // switch's lease (its whole confirmation window), the send is held at once, like any held send, and says why.
+    const target = resolved.sessions.length === 1 ? resolved.sessions[0]!.sessionName : null;
+    const switching = target ? runtimeSwitchSummary(db, { session: target }) : null;
+    if (target && switching && (switching.phase === "preparing" || switching.phase === "confirmed")) {
+      return c.json({ ok: true, sessionName: target, outcome: "retained", sent: false, verified: false, reason: "runtime_switch_in_progress",
+        runtimeSwitch: switching,
+        warning: `${target} is switching runtime (${switching.from} -> ${switching.to}, switch ${switching.id}) until about ${switching.deadlineAt}. Send it again after the switch; it then reaches whoever holds the seat.` });
+    }
+    const sendStartedAt = new Date().toISOString();
+
+    const result = await transport.send(body.session, body.text ?? "", {
+      deliveryId: body.deliveryId,
+      verify: body.verify,
+      force: body.force,
+      waitForIdleMs: body.waitForIdleMs,
+      dangerouslyInteract: body.dangerouslyInteract,
+      typeWithoutChecking: body.typeWithoutChecking,
+      reason: body.reason,
+      actorSession: derivedActor, // transport-derived, never the body claim
+      ...sendIdentity,
+      // Anyone may mark a send urgent; who marked it is the transport-derived sender, never a body claim.
+      ...(body.urgent === true ? { urgent: { by: derivedActor ?? "unknown" } } : {}),
+      // Mechanics-gate fix (d9b3989a): the walk retry's bare-Enter mode, guarded in the
+      // transport by the expected-staged-text precheck.
+      submitOnly: body.submitOnly,
+      expectedStagedText: body.expectedStagedText,
+      expectedStagedLineCount: body.expectedStagedLineCount,
+      exactText,
+      // The caller's request: if it goes away while the send still waits, nothing is typed later.
+      signal: c.req.raw.signal,
+    });
+
+    // The seat's own agent typing into its own terminal is told apart where the sender is known: it's treated like any
+    // agent's message, and recorded as its own.
+    const self = !!derivedActor && resolved.sessions.length === 1 && resolved.sessions[0]!.sessionName === derivedActor;
+    if (self) Object.assign(result, { fromDestinationSeat: true });
+    if (result.outcome === "retained") return c.json(result);
+
+    if (!result.ok) {
+      const statusMap: Record<string, number> = {
+        typing_guard_enabled: 409,
+        caller_cancelled: 409,
+        guard_target_unknown: 409,
+        guard_target_changed: 409,
+        delivery_identity_conflict: 409,
+        retained_quota_full: 409,
+        delivery_already_attempted: 409,
+        delivery_in_progress: 409,
+        delivery_indeterminate: 409,
+        override_input_present: 409,
+        override_input_unknown: 409,
+        draft_input_busy: 409,
+        draft_input_unknown: 409,
+        draft_input_changed: 409,
+        draft_hold_expired: 409,
+        draft_wake_superseded: 409,
+        session_missing: 404,
+        tmux_unavailable: 503,
+        transport_unavailable: 409,
+        mid_work: 409,
+        invalid_wait_for_idle: 400,
+        invalid_dangerously_interact: 400,
+        dangerously_interact_requires_reason: 400,
+        wait_for_idle_timeout: 409,
+        target_needs_input: 409,
+        target_activity_unknown: 409,
+        prompt_override_audit_unavailable: 500,
+        submit_failed: 502,
+        send_failed: 502,
+        invalid_submit_only: 400,
+        staged_mismatch: 409,
+        pane_in_mode: 409,
+      };
+      const status = (statusMap[result.reason ?? ""] ?? 500) as 400 | 404 | 409 | 500 | 502 | 503;
+      // A send that waited while its seat switched runtime: say so, and that it needs sending again.
+      const moved = result.reason === "guard_target_changed" && result.sent === false && target ? runtimeSwitchCommittedSince(db, target, sendStartedAt) : null;
+      if (moved) {
+        Object.assign(result, { runtimeSwitch: moved,
+          error: `${result.error ?? "The seat changed while this send waited."} ${target} moved to ${moved.to} (runtime switch ${moved.id}) while this send waited, so nothing was typed. Send it again to reach its new occupant.` });
+      }
+      return c.json(result, status);
+    }
+
+    // A3 (P22): auto-record the DISPATCHED send into the sender-side outbox, so a derived send cannot
+    // accept-and-drop at the audit layer (the specimen-5 window: no outbox row, attribution survived only
+    // via provider JSONL). STRICTLY DOWNSTREAM of the certified header-derivation (line 65): it consumes
+    // the already-derived `derivedActor`, never re-derives or alters it. Records only a DERIVED send —
+    // `derivedActor` present — with the era-stamp `transport:v1` (the sole mode this header-derived route
+    // produces; a cross-host relay's header IS the origin triple, so the recorded sender is the ORIGIN,
+    // never the relay). A null-actor send has no derived sender to attribute (no fabricated row). The
+    // send is already committed, so a rare audit-write failure is LOGGED, never a false-negative on a
+    // delivered send.
+    if (derivedActor && !body.submitOnly && !result.outboxIds?.length) { // Deferred sends already own their original outbox rows.
+      const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
+      if (outbox) {
+        try {
+          const entry = outbox.record({
+            senderSession: derivedActor,
+            destinationSession: body.session,
+            body: result.envelopeOmitted && exactText !== undefined ? exactText : body.text,
+            ...sendIdentity,
+          });
+          // The input was dispatched successfully; mark its audit row as broadcast does.
+          outbox.markDelivered(entry.outboxId);
+        } catch (err) {
+          console.warn(`[transport/send] outbox auto-record failed (send already delivered): ${(err as Error).message}`);
+        }
+      }
+    }
+
+    // S2 (OPR.0.5.4.3) sender-side honesty: an unattributed delivery tells the sender, on the
+    // success payload the CLI renderers surface, that the recipient cannot know who sent it.
+    // Composes with any existing transport warning; attributed sends see no change and no nag.
+    if (!derivedActor) {
+      result.warning = result.warning ? `${result.warning} ${UNKNOWN_SENDER_NOTICE}` : UNKNOWN_SENDER_NOTICE;
+    }
+
+    return c.json(result);
+  });
+
+  router.post("/capture", async (c) => {
+    const transport = c.get("sessionTransport" as never) as SessionTransport;
+    const body = await c.req.json<{
+      session?: string;
+      rig?: string;
+      pod?: string;
+      lines?: number;
+      inputBox?: boolean;
+      readable?: { width?: unknown; height?: unknown };
+    }>();
+    // Read an agent seat's input box only when the request asks: `rig capture` and the MCP tool do; send --verify and
+    // walk read only the pane text. The same readers learn when a pane is too small to show a prompt.
+    const inputBox = body.inputBox === true;
+    const promptPane = inputBox;
+    // `rig capture --readable` / `--size WxH`: read a small seat at that size, then give its window back.
+    const dimension = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1000;
+    if (body.readable !== undefined && !(dimension(body.readable?.width) && dimension(body.readable?.height))) {
+      return c.json({ ok: false, error: "readable needs a width and height, whole numbers from 1 to 1000" }, 400);
+    }
+    const readable = body.readable ? { width: body.readable.width as number, height: body.readable.height as number } : undefined;
+
+    // Multi-target: rig or pod
+    if (body.rig || body.pod) {
+      const target: TargetSpec = body.pod
+        ? { pod: body.pod, rig: body.rig }
+        : { rig: body.rig! };
+
+      const resolved = await transport.resolveSessions(target);
+      if (!resolved.ok) {
+        return c.json({ ok: false, error: resolved.error }, 404);
+      }
+
+      // One budget for the whole fan-out's input-box reads, so slow tmux adds at most that to the request.
+      const inputBoxBudget = { remainingMs: CAPTURE_INPUT_BOX_DEADLINE_MS };
+      // And one for readable reads, so a fan-out of small seats returns inside the CLI's wait.
+      const readableBudget = { remainingMs: CAPTURE_READABLE_BUDGET_MS };
+      const results = [];
+      for (const session of resolved.sessions) {
+        const result = await transport.capture(session.sessionName, { lines: body.lines, inputBox, inputBoxBudget, promptPane,
+          ...(readable ? { readable, readableBudget } : {}) });
+        results.push(result);
+      }
+      return c.json({ results });
+    }
+
+    // Single target: session
+    if (!body.session) {
+      return c.json({ error: "Provide session, rig, or pod to capture" }, 400);
+    }
+
+    const result = await transport.capture(body.session, { lines: body.lines, inputBox, promptPane, ...(readable ? { readable } : {}) });
+    if (!result.ok) {
+      const statusMap: Record<string, number> = {
+        session_missing: 404,
+        tmux_unavailable: 503,
+        transport_unavailable: 409,
+        capture_failed: 502,
+      };
+      const status = (statusMap[result.reason ?? ""] ?? 404) as 404 | 409 | 502 | 503;
+      return c.json(result, status);
+    }
+    return c.json(result);
+  });
+
+  router.post("/broadcast", async (c) => {
+    const transport = c.get("sessionTransport" as never) as SessionTransport;
+    const body = await c.req.json<{
+      rig?: string;
+      pod?: string;
+      // OPR.0.4.3.30 — explicit multi-recipient list (`rig send --to a,b`).
+      sessions?: string[];
+      text: string;
+      verify?: boolean;
+      force?: boolean;
+      // OPR.0.4.3.30 — plumbed through so `rig send` fan-out carries the same guard/wait
+      // semantics as a single send. Each is applied PER recipient inside broadcast()'s loop
+      // (the danger audit fires once per seat, not once per batch).
+      waitForIdleMs?: number;
+      dangerouslyInteract?: boolean;
+      typeWithoutChecking?: boolean;
+      reason?: string;
+      actorSession?: string | null;
+      urgent?: boolean;
+      // OPR.0.4.3.30 — when set, the fan-out wraps each recipient in its own From/To envelope.
+      // `rig broadcast` never sets it (raw-to-all, unchanged).
+      envelopeSender?: string | null;
+    }>();
+
+    if (!body.text) {
+      return c.json({ error: "Missing required field: text" }, 400);
+    }
+
+    // P21 I4 + S2 (OPR.0.5.4.3): the --dangerously-interact override AUDIT actor is DERIVED from the
+    // transport header (see /send). An absent header no longer refuses — the send proceeds and the
+    // audit's already-nullable actor records null (projected "unknown"); the response carries the
+    // sign-it notice below.
+    if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
+      error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
+    const derivedActor = transportSenderSession(c) ?? null;
+    // Slice 16: a runtime switch's own predecessor or not-yet-committed successor doesn't send as the seat.
+    const switchHeld = runtimeSwitchCustodyRefusal(c.get("db" as never) as Database.Database, derivedActor, c.req.header(OCCUPANT_GENERATION_HEADER));
+    if (switchHeld) return c.json(switchHeld.body, switchHeld.status);
+
+    // P21 I4 (orch ruling from specimen 5 — the false "From: pm-lead" the incident acted upon): the
+    // From: line rendered into every recipient's terminal MUST DERIVE from the transport identity, never
+    // the body value. A present body.envelopeSender signals the ENVELOPED fan-out (rig send); its value
+    // is IGNORED and the From: is the derived actor. A cross-host relay re-stamps X-OpenRig-Session from
+    // ITS authenticated context (not a caller --from string). S2 (OPR.0.5.4.3): an unattributable
+    // enveloped send now DELIVERS with the explicit unknown-sender marker as its From: — the specimen-5
+    // rule is preserved unweakened: the body claim is STILL never rendered; the recipient sees honest
+    // "unknown", never an unverified name. Raw `rig broadcast` = no envelope.
+    let envelopeSender: string | undefined = undefined;
+    if (body.envelopeSender !== undefined && body.envelopeSender !== null) {
+      envelopeSender = derivedActor ?? UNKNOWN_SENDER_MARKER;
+    }
+
+    const target: TargetSpec =
+      body.sessions && body.sessions.length > 0
+        ? { sessions: body.sessions }
+        : body.pod
+          ? { pod: body.pod, rig: body.rig }
+          : body.rig
+            ? { rig: body.rig }
+            : { global: true };
+
+    const result = await transport.broadcast(target, body.text, {
+      verify: body.verify,
+      force: body.force,
+      waitForIdleMs: body.waitForIdleMs,
+      dangerouslyInteract: body.dangerouslyInteract,
+      typeWithoutChecking: body.typeWithoutChecking,
+      reason: body.reason,
+      actorSession: derivedActor, // transport-derived, never the body claim
+      ...(body.urgent === true ? { urgent: { by: derivedActor ?? "unknown" } } : {}),
+      envelopeSender, // the From: is the DERIVED identity (never the body value) — orch ruling (a)
+      ...(derivedActor ? { identityProvenance: "transport:v1" } : {}),
+      // Recipients not yet started when the caller goes away are not written; started ones keep their results.
+      signal: c.req.raw.signal,
+    });
+
+    // A3b (P22 follow-on, planner-ruled IN scope): auto-record the fan-out — N rows, ONE per RESOLVED
+    // recipient. The schema is a per-recipient design (destination_session is typed + indexed; per-row
+    // delivery_state), so a partial fan-out records the TRUTH per recipient, never a lossy aggregate.
+    // STRICTLY DOWNSTREAM of the certified derivation (derivedActor above): each row's sender is the
+    // already-derived actor; destination = the RESOLVED session, NEVER the TargetSpec (which would poison
+    // the typed session column). Best-effort per row: the fan-out is already dispatched, so a rare
+    // audit-write failure is logged, never a false-negative on delivery.
+    if (derivedActor) {
+      const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
+      if (outbox) {
+        for (const r of result.results) {
+          if (!r.sessionName || r.outcome === "retained" || r.outboxIds?.length) continue;
+          try {
+            const entry = outbox.record({
+              senderSession: derivedActor,
+              destinationSession: r.sessionName,
+              body: body.text,
+              identityProvenance: "transport:v1",
+            });
+            if (r.ok) outbox.markDelivered(entry.outboxId);
+            else outbox.markFailed(entry.outboxId);
+          } catch (err) {
+            console.warn(`[transport/broadcast] outbox auto-record failed for ${r.sessionName} (fan-out already dispatched): ${(err as Error).message}`);
+          }
+        }
+      }
+    }
+
+    // S2 (OPR.0.5.4.3) sender-side honesty: an unattributed fan-out's response carries the
+    // sign-it notice for the CLI renderers to surface. Attributed fan-outs are unchanged.
+    if (!derivedActor) {
+      return c.json({ ...result, warning: UNKNOWN_SENDER_NOTICE });
+    }
+    return c.json(result);
+  });
+
+  return router;
+}

@@ -1,0 +1,93 @@
+// B8 PROBE-HONESTY (shape 73ee4b25, floor-A ruled) — the CLI tells the truth about what
+// it KNOWS vs what it INFERS. RED-first against current main.
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { statusGuardMessage, daemonStatusGuard } from "../src/daemon-lifecycle.js";
+import type { DaemonStatus } from "../src/daemon-lifecycle.js";
+
+describe("B8-1b — epistemic-matched precheck language (the ONE helper)", () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => { errSpy = vi.spyOn(console, "error").mockImplementation(() => {}); process.exitCode = undefined; });
+  afterEach(() => { errSpy.mockRestore(); process.exitCode = undefined; });
+
+  it("UNVERIFIED passes silently: a daemon that may be busy gets the real request, which decides", () => {
+    // Changed: this used to refuse with "did not respond". A busy daemon is not refused; the command's own
+    // request, under its normal timeout, reports what happened.
+    expect(daemonStatusGuard({ state: "unverified" } as DaemonStatus)).toBe(true);
+    expect(errSpy.mock.calls.length).toBe(0);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("STOPPED renders the not-running 3-part (positive evidence keeps the plain truth)", () => {
+    const ok = daemonStatusGuard({ state: "stopped" } as DaemonStatus);
+    expect(ok).toBe(false);
+    const out = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toMatch(/not running/i);
+  });
+
+  it("RUNNING passes silently whether or not its health check answered healthy (busy is not down)", () => {
+    // Changed: RUNNING+unhealthy used to refuse. Its process is alive; the real request decides.
+    expect(daemonStatusGuard({ state: "running", healthy: true } as DaemonStatus)).toBe(true);
+    expect(daemonStatusGuard({ state: "running", healthy: false, reason: "unresponsive" } as DaemonStatus)).toBe(true);
+    expect(daemonStatusGuard({ state: "running", healthy: false, reason: "event-loop-starved" } as DaemonStatus)).toBe(true);
+    expect(errSpy.mock.calls.length).toBe(0);
+  });
+
+  it("STALE, a refused probe and a probe the OS blocked still refuse", () => {
+    expect(daemonStatusGuard({ state: "stale" } as DaemonStatus)).toBe(false);
+    expect(daemonStatusGuard({ state: "running", healthy: false, reason: "unresponsive", probeErrorCode: "ECONNREFUSED" } as DaemonStatus)).toBe(false);
+    expect(daemonStatusGuard({ state: "unverified", probeErrorCode: "EPERM" } as DaemonStatus)).toBe(false);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("sibling hint still refuses and renders (the request could reach another home's daemon)", () => {
+    expect(daemonStatusGuard({ state: "unverified", siblingHint: { resolvedHome: "/a/.openrig", siblingHome: "/a/.openrig-vm" } } as DaemonStatus)).toBe(false);
+    const out = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toContain("/a/.openrig-vm");
+  });
+
+  it("statusGuardMessage is pure (language derives from the epistemic state)", () => {
+    expect(statusGuardMessage({ state: "unverified" } as DaemonStatus).fact).toMatch(/did not respond/i);
+    expect(statusGuardMessage({ state: "stopped" } as DaemonStatus).fact).toMatch(/not running/i);
+  });
+});
+
+describe("B8-1b — chokepoint adoption census (the grep-guard pin)", () => {
+  it("ZERO literal 'Daemon not running' renders outside daemon-lifecycle.ts (55-site class killed)", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const path = await import("node:path");
+    const root = path.resolve(import.meta.dirname, "../src");
+    let out = "";
+    try {
+      // RENDER forms only: console prints, thrown Errors, and structured facts. The
+      // detection regex (cross-host-executor), help-text exit-code docs, and comments
+      // legitimately carry the phrase and are NOT render sites.
+      out = execFileSync("grep", ["-rnE", "(console\\.(error|log)\\(|new Error\\(|fact:)[^\\n]*\"Daemon not running", root, "--include=*.ts"], { encoding: "utf-8" });
+    } catch { out = ""; } // grep exit 1 = no matches
+    const offenders = out.split("\n").filter((l) => l && !l.includes("daemon-lifecycle.ts"));
+    expect(offenders).toEqual([]); // every precheck RENDER routes through the ONE helper
+  });
+});
+
+// ── B8-2: send timeout = delivery-UNCONFIRMED, never "not sent" ─────────────────
+import { printTransportFailureForTest } from "../src/commands/send.js";
+import { DaemonTimeoutError, DaemonConnectionError } from "../src/client.js";
+
+describe("B8-2 — send transport honesty (indeterminate ≠ failed)", () => {
+  let errSpy2: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => { errSpy2 = vi.spyOn(console, "error").mockImplementation(() => {}); });
+  afterEach(() => errSpy2.mockRestore());
+
+  it("a TIMEOUT renders delivery-unconfirmed + reconcile-by-effect — NEVER 'was not sent'", () => {
+    printTransportFailureForTest(new DaemonTimeoutError("Request to /api/transport/send timed out after 5000ms"));
+    const out = errSpy2.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toMatch(/delivery unconfirmed|may have received/i);
+    expect(out).toMatch(/check the (pane|target)|reconcile/i);
+    expect(out).not.toMatch(/was not sent/i);
+  });
+
+  it.each(["ECONNREFUSED", "ENOTFOUND"])("a coded %s keeps the hard 'not sent' truth", (code) => {
+    printTransportFailureForTest(new DaemonConnectionError(`fetch failed: ${code}`, code));
+    const out = errSpy2.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(out).toMatch(/was not sent/i);
+  });
+});
