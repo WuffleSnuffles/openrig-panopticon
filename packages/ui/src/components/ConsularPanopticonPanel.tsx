@@ -1,116 +1,329 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 
-export interface ConsularDialogueItem {
+export interface ConsulSummary {
   id: string;
-  sender: "Consul Nia Nova" | "Consul Ferric Lunaux" | "Overseer";
+  title: string;
+  name: string;
+  model: string;
+  archetype?: string;
+  epithet?: string;
+}
+
+export interface CubicleSeat {
+  id: string;
+  config: {
+    enabled: boolean;
+    display_name: string;
+    model: string;
+  };
+  status: string;
+  current_task_id: string | null;
+  surface_thoughts: string;
+  stamina_percentage: number;
+  evidence_rung: string;
+  occupant_generation: string;
+}
+
+export interface DialogueEntry {
+  id: string;
+  sender: string;
   content: string;
-  thinking?: string;
-  replyTo?: { id: string; sender: string; content: string };
+  phase: string;
   timestamp: string;
 }
 
-export interface ConsularPanopticonPanelProps {
-  initialDialogue?: ConsularDialogueItem[];
-  niaStatus?: "checking_workers" | "working" | "debating" | "idle";
-  ferricStatus?: "verifying" | "working" | "debating" | "idle";
-  onSendDirective?: (prompt: string) => void | Promise<void>;
+export interface ConsularGovernanceStatus {
+  mode: string;
+  engine: string;
+  consuls: ConsulSummary[];
+  cubicles: CubicleSeat[];
+  tasks: {
+    todo: number;
+    in_progress: number;
+    review: number;
+    done: number;
+    items?: {
+      todo: any[];
+      in_progress: any[];
+      review: any[];
+      done: any[];
+    };
+  };
+  dialogue: DialogueEntry[];
+  openrigSubsystems?: {
+    seatLifecycle: { active: boolean; totalSeats: number };
+    seatActivity: { active: boolean; rungs: string[] };
+    healthDetectors: { schema: string; detectors: string[] };
+    streamClassifier: { active: boolean; mode: string };
+    seatRecapStore: { active: boolean; format: string };
+    crashCart: { active: boolean; daemonState: string };
+  };
+  timestamp: string;
 }
 
-export function ConsularPanopticonPanel({
-  initialDialogue = [],
-  niaStatus = "checking_workers",
-  ferricStatus = "verifying",
-  onSendDirective,
-}: ConsularPanopticonPanelProps) {
-  const [dialogue, setDialogue] = useState<ConsularDialogueItem[]>(initialDialogue);
-  const [input, setInput] = useState("");
+export const ConsularPanopticonPanel: React.FC<{ daemonUrl?: string }> = ({
+  daemonUrl = "",
+}) => {
+  const [status, setStatus] = useState<ConsularGovernanceStatus | null>(null);
+  const [prompt, setPrompt] = useState("");
+  const [sending, setSending] = useState(false);
+  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const fetchStatus = async () => {
+    try {
+      const r = await fetch(`${daemonUrl}/api/governance/status`);
+      const data = await r.json();
+      setStatus(data);
+    } catch {}
+  };
+
+  useEffect(() => {
+    void fetchStatus();
+    const timer = setInterval(fetchStatus, 4000);
+    return () => clearInterval(timer);
+  }, [daemonUrl]);
+
+  const sendDirective = async (e: React.FormEvent) => {
     e.preventDefault();
-    const trimmed = input.trim();
-    if (!trimmed) return;
-    setInput("");
-    const userMsg: ConsularDialogueItem = {
-      id: `msg-${Date.now()}`,
-      sender: "Overseer",
-      content: trimmed,
-      timestamp: new Date().toISOString(),
-    };
-    setDialogue((prev) => [...prev, userMsg]);
-    await onSendDirective?.(trimmed);
+    if (!prompt.trim() || sending) return;
+    setSending(true);
+    try {
+      await fetch(`${daemonUrl}/api/governance/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      setPrompt("");
+      await fetchStatus();
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const triggerCrashCartRestore = async () => {
+    try {
+      const r = await fetch(`${daemonUrl}/api/governance/crash-cart/restore`, {
+        method: "POST",
+      });
+      const data = await r.json();
+      setRestoreNotice(`Crash-Cart Fleet Restore (${data.fleetAttemptId}): ${data.verdict}`);
+    } catch {}
   };
 
   return (
     <section
-      className="flex flex-col gap-3 rounded border border-zinc-800 bg-zinc-950 p-4 text-zinc-100"
       data-testid="consular-panopticon-panel"
+      style={{
+        border: "2px solid #ff2a6d",
+        background: "#07070c",
+        color: "#e0e6ed",
+        padding: "16px",
+        fontFamily: "monospace",
+      }}
     >
-      <header className="flex items-center justify-between border-b border-zinc-800 pb-3">
-        <div className="flex items-center gap-2" data-testid="consul-nia-header">
-          <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-500" />
-          <span className="font-semibold tracking-wide text-amber-400">Consul Nia Nova</span>
-          <span className="rounded bg-zinc-900 px-2 py-0.5 text-xs text-zinc-300" data-testid="nia-activity-badge">
-            {niaStatus}
-          </span>
+      {/* Twin-Sauron & OpenRig Engine Header */}
+      <header
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          borderBottom: "1px solid #ff2a6d",
+          paddingBottom: "10px",
+          marginBottom: "14px",
+        }}
+      >
+        <div>
+          <strong style={{ color: "#ff2a6d", letterSpacing: "0.08em", fontSize: "15px" }}>
+            TWIN-SAURON PANOPTICON // ROMAN DUAL-CONSUL GOVERNANCE (OPENRIG ENGINE)
+          </strong>
+          <div style={{ fontSize: "11px", color: "#05d5fa", marginTop: "4px" }}>
+            Subsystems Active: SeatLifecycle (Gen-Fenced) | 4-Rung Activity Ladder | 6 Health Detectors | Lease Stream Classifier | RECAP.md Store | Crash-Cart B1/C2/C3
+          </div>
         </div>
-        <div className="text-xs font-mono uppercase tracking-widest text-zinc-400">
-          Roman Dual-Consul Governance · 2/2 Gate Consensus
-        </div>
-        <div className="flex items-center gap-2" data-testid="consul-ferric-header">
-          <span className="rounded bg-zinc-900 px-2 py-0.5 text-xs text-zinc-300" data-testid="ferric-activity-badge">
-            {ferricStatus}
+        <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+          <button
+            type="button"
+            onClick={triggerCrashCartRestore}
+            style={{
+              background: "#141424",
+              color: "#05d5fa",
+              border: "1px solid #05d5fa",
+              padding: "6px 10px",
+              cursor: "pointer",
+              fontFamily: "monospace",
+              fontSize: "11px",
+            }}
+          >
+            CRASH-CART FLEET RESTORE (AMENDMENT 2)
+          </button>
+          <span style={{ color: "#05d5fa", fontSize: "12px" }}>
+            {status?.engine || "openrig-panopticon-v1"}
           </span>
-          <span className="font-semibold tracking-wide text-sky-400">Consul Ferric Lunaux</span>
-          <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-500" />
         </div>
       </header>
 
-      <div className="flex max-h-80 flex-col gap-2 overflow-y-auto py-2" data-testid="consular-dialogue-feed">
-        {dialogue.map((item) => (
-          <article key={item.id} className="rounded border border-zinc-800/80 bg-zinc-900/60 p-2.5 text-base">
-            {item.replyTo && (
-              <div className="mb-1 border-l-2 border-zinc-600 pl-2 text-xs text-zinc-400">
-                Replying to {item.replyTo.sender}: {item.replyTo.content}
-              </div>
-            )}
-            {item.thinking && (
-              <div className="mb-1.5 line-clamp-2 text-xs italic text-zinc-400" data-testid="inline-deliberation-summary">
-                {item.thinking}
-              </div>
-            )}
-            <div className="font-medium text-zinc-200">
-              <span className="mr-2 font-bold text-amber-300">{item.sender}:</span>
-              <span>{item.content}</span>
+      {restoreNotice && (
+        <div
+          style={{
+            background: "#0d2630",
+            border: "1px solid #05d5fa",
+            padding: "8px 12px",
+            marginBottom: "12px",
+            fontSize: "12px",
+          }}
+        >
+          {restoreNotice}
+        </div>
+      )}
+
+      {/* Dual Consuls Bar */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "14px" }}>
+        {(status?.consuls || []).map((c) => (
+          <div
+            key={c.id}
+            style={{
+              border: "1px solid #2a2f45",
+              padding: "10px",
+              background: "#0e101a",
+            }}
+          >
+            <div style={{ color: "#05d5fa", fontWeight: 700 }}>{c.name}</div>
+            <div style={{ fontSize: "12px", opacity: 0.85 }}>
+              {c.title} — {c.model} ({c.epithet || "Consul"})
             </div>
-          </article>
+          </div>
         ))}
       </div>
 
-      <form onSubmit={handleSubmit} className="flex items-center gap-2 pt-1">
-        <button
-          type="button"
-          aria-label="Add attachment"
-          className="rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm font-bold text-zinc-200"
-          data-testid="single-plus-attachment-btn"
+      {/* Main 3-Zone Panopticon Layout: 16-Cubicle Matrix | Overseer Console | 4-Column Kanban */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1.2fr 1.1fr", gap: "14px" }}>
+        {/* Left: 16-Cubicle Matrix */}
+        <div style={{ border: "1px solid #2a2f45", padding: "10px", background: "#0b0d14" }}>
+          <div style={{ color: "#ff2a6d", fontWeight: 700, marginBottom: "8px", fontSize: "12px" }}>
+            16-CUBICLE MATRIX (OPENRIG SEAT LIFECYCLE & 4-RUNG EVIDENCE)
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "6px" }}>
+            {(status?.cubicles || []).map((cub) => (
+              <div
+                key={cub.id}
+                style={{
+                  border: `1px solid ${cub.status === "working" ? "#05d5fa" : "#25293a"}`,
+                  padding: "6px",
+                  background: "#101320",
+                  fontSize: "10px",
+                }}
+              >
+                <div style={{ fontWeight: 700, color: cub.status === "working" ? "#05d5fa" : "#9aa5b1" }}>
+                  {cub.id.toUpperCase()}
+                </div>
+                <div>{cub.status.toUpperCase()}</div>
+                <div style={{ color: "#7b8794", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  Rung: {cub.evidence_rung}
+                </div>
+                <div
+                  style={{
+                    color: "#cbd2d9",
+                    marginTop: "3px",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={cub.surface_thoughts}
+                >
+                  {cub.surface_thoughts}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Center: Overseer Console */}
+        <div
+          style={{
+            border: "1px solid #2a2f45",
+            padding: "10px",
+            background: "#0b0d14",
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "space-between",
+          }}
         >
-          +
-        </button>
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Direct Consuls Nia Nova & Ferric Lunaux..."
-          className="flex-1 rounded border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100"
-          data-testid="overseer-prompt-input"
-        />
-        <button
-          type="submit"
-          className="rounded bg-amber-600 px-3 py-1.5 text-sm font-semibold text-zinc-950"
-          data-testid="overseer-send-btn"
-        >
-          Transmit
-        </button>
-      </form>
+          <div>
+            <div style={{ color: "#05d5fa", fontWeight: 700, marginBottom: "8px", fontSize: "12px" }}>
+              CONSULAR DIALOGUE & OVERSEER DIRECTIVES
+            </div>
+            <div style={{ maxHeight: "220px", overflowY: "auto", fontSize: "11px", display: "grid", gap: "6px" }}>
+              {(status?.dialogue || []).slice(-8).map((msg) => (
+                <div
+                  key={msg.id}
+                  style={{
+                    borderLeft: `2px solid ${msg.sender.includes("Nia") ? "#ff2a6d" : msg.sender.includes("Ferric") ? "#05d5fa" : "#f59e0b"}`,
+                    paddingLeft: "8px",
+                  }}
+                >
+                  <strong style={{ color: "#e0e6ed" }}>{msg.sender}: </strong>
+                  <span>{msg.content}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <form onSubmit={sendDirective} style={{ display: "flex", gap: "6px", marginTop: "10px" }}>
+            <input
+              type="text"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Issue directive to Consuls Nia & Ferric..."
+              style={{
+                flex: 1,
+                background: "#141824",
+                color: "#e0e6ed",
+                border: "1px solid #2a2f45",
+                padding: "6px 8px",
+                fontFamily: "monospace",
+                fontSize: "12px",
+              }}
+            />
+            <button
+              type="submit"
+              disabled={sending}
+              style={{
+                background: "#ff2a6d",
+                color: "#fff",
+                border: "none",
+                padding: "6px 12px",
+                cursor: "pointer",
+                fontFamily: "monospace",
+                fontWeight: 700,
+              }}
+            >
+              SEND
+            </button>
+          </form>
+        </div>
+
+        {/* Right: 4-Column Kanban Summary */}
+        <div style={{ border: "1px solid #2a2f45", padding: "10px", background: "#0b0d14" }}>
+          <div style={{ color: "#ff2a6d", fontWeight: 700, marginBottom: "8px", fontSize: "12px" }}>
+            KANBAN TASKBOARD (GATE 1 & GATE 2)
+          </div>
+          {status?.tasks && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "12px" }}>
+              <div style={{ border: "1px solid #25293a", padding: "8px" }}>
+                TODO: <strong>{status.tasks.todo}</strong>
+              </div>
+              <div style={{ border: "1px solid #25293a", padding: "8px" }}>
+                IN PROGRESS: <strong>{status.tasks.in_progress}</strong>
+              </div>
+              <div style={{ border: "1px solid #25293a", padding: "8px" }}>
+                GATE 2 REVIEW: <strong>{status.tasks.review}</strong>
+              </div>
+              <div style={{ border: "1px solid #25293a", padding: "8px", color: "#10b981" }}>
+                DONE: <strong>{status.tasks.done}</strong>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </section>
   );
-}
+};
