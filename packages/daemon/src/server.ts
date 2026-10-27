@@ -106,6 +106,7 @@ import { missionControlRoutes } from "./routes/mission-control.js";
 import { slicesRoutes } from "./routes/slices.js";
 import { reviewRoutes } from "./routes/review.js";
 import { rigModeRoutes } from "./routes/rig-mode.js";
+import { consularGovernanceRoutes } from "./routes/consular-governance.js";
 import { missionsRoutes } from "./routes/missions.js";
 import { rigCmuxRoutes } from "./routes/rig-cmux.js";
 import { terminalRoutes, rigTerminalRoutes } from "./routes/terminal.js";
@@ -849,6 +850,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/gateway", gatewayRoutes({ relayBearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/rigs/:rigId/env", envRoutes());
   app.route("/api/restore-check", restoreCheckRoutes);
+  app.route("/api/governance", consularGovernanceRoutes());
   // Slice 09 (OPR.0.3.2.9) — rig-policy bindings (operator context mode).
   // Same operator-bearer posture as mission-control; HG-SAFE preserved.
   app.route(

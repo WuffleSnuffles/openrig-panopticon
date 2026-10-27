@@ -31,34 +31,10 @@ test("buildDocsGuardMessage explains the policy and offending files", () => {
   assert.match(message, /docs\/as-built\/, docs\/reference\/, and docs\/releases\//);
 });
 
-// 572bc477 — docs/DESIGN.md is RATIFIED doctrine, and the guard failed to encode it.
-//
-// `docs/as-built/ui/library-specs-and-design-system.md` §4 states it outright: "The canonical
-// OpenRig visual/design system is `docs/DESIGN.md` (at the repo `docs/` root, NOT under
-// `docs/as-built/`). Q1 is ratified: DESIGN.md stays at root, byte-identical."
-//
-// Root placement is therefore a deliberate, recorded decision — not drift to be tidied away.
-// It also cannot be satisfied by relocating into any allowed root:
-//   docs/as-built/  — all 24 files there carry `last-verified-against-source`; DESIGN.md is not
-//                     source-derived, and Q1 explicitly rules this out anyway
-//   docs/reference/ — that directory SHIPS (build-package.sh stages it into the package and the
-//                     daemon materializes it to $OPENRIG_HOME/reference/), so moving there would
-//                     start distributing the brand spec to every operator
-//   docs/releases/  — not a release note
-// So this one file is named explicitly rather than relocated, and the directory allowlist is
-// left alone. Consequence today: root `npm run test:repo` cannot pass on a clean tree, which
-// trains people to ignore a gate that is otherwise doing real work.
 test("findBlockedDocsPaths allows the ratified docs/DESIGN.md root placement", () => {
   assert.deepEqual(findBlockedDocsPaths(["docs/DESIGN.md"]), []);
 });
 
-// Guard-of-the-guard: the exception must be EXACT-PATH, never a hole in the docs/ root. If this
-// ever goes green for a sibling root file, the fix has widened into a directory allowance and
-// the ephemera policy the guard exists to enforce is gone.
-// Deliberately does NOT include docs/DESIGN.md in the input: this pin must hold IDENTICALLY
-// before and after the fix. Coupling it to the new allowance would make it a third RED and
-// destroy its value — an invariant that only starts passing once you change the code is not
-// an invariant, it is a restatement of the feature.
 test("the DESIGN.md exception is exact-path — sibling root docs and plan/note folders stay blocked", () => {
   assert.deepEqual(
     findBlockedDocsPaths([
@@ -70,15 +46,7 @@ test("the DESIGN.md exception is exact-path — sibling root docs and plan/note 
   );
 });
 
-// Integration: the unit contract above is worthless if the real script still fails on the real
-// tree. This asserts the actual operator-visible outcome — `npm run test:repo` can be green and
-// therefore trustworthy again.
 test("the real check-docs-guard.mjs exits 0 against the actual repository", () => {
-  // process.execPath, not ambient "node": pins the child to the SAME runtime executing this
-  // test rather than whatever PATH happens to resolve.
-  // fileURLToPath, not URL.pathname: pathname stays percent-encoded, so a checkout under a
-  // path containing spaces would silently resolve to the wrong cwd — this repo has no spaces,
-  // so the naive form passes HERE and fails elsewhere, which is the worst kind of green.
   const result = execFileSync(process.execPath, ["scripts/check-docs-guard.mjs"], {
     encoding: "utf8",
     cwd: fileURLToPath(new URL("..", import.meta.url)),
@@ -94,15 +62,20 @@ test("the real tracked-path reader preserves unusual documentation filenames", a
   const { join } = await import("node:path");
   const repo = mkdtempSync(join(tmpdir(), "openrig-docs-guard-"));
   try {
-    const paths = ["docs/notes\nextra.md", "docs/équipe.md", "docs/reference/topic\tname.md"];
+    const blockedUnusual = process.platform === "win32" ? "docs/notes-éxtra.md" : "docs/notes\nextra.md";
+    const allowedUnusual = process.platform === "win32" ? "docs/reference/topic — name.md" : "docs/reference/topic\tname.md";
+    const paths = [blockedUnusual, "docs/équipe.md", allowedUnusual];
     execFileSync("git", ["init", "--quiet", repo]);
     mkdirSync(join(repo, "docs/reference"), { recursive: true });
+    if (process.platform !== "win32") {
+      mkdirSync(join(repo, "docs"), { recursive: true });
+    }
     for (const file of paths) writeFileSync(join(repo, file), "fixture");
     execFileSync("git", ["add", "--", "docs"], { cwd: repo });
     const tracked = listTrackedDocsPaths((command, args, options) =>
       execFileSync(command, args, { ...options, cwd: repo }));
     assert.deepEqual([...tracked].sort(), [...paths].sort());
-    assert.deepEqual(findBlockedDocsPaths(tracked), ["docs/notes\nextra.md", "docs/équipe.md"]);
+    assert.deepEqual(findBlockedDocsPaths(tracked), [blockedUnusual, "docs/équipe.md"].sort());
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
